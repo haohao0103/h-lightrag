@@ -6,6 +6,7 @@ STORAGE_IMPLEMENTATIONS = {
             "PGKVStorage",
             "MongoKVStorage",
             "OpenSearchKVStorage",
+            "HugeGraphKVStorage",
         ],
         "required_methods": ["get_by_id", "upsert"],
     },
@@ -17,6 +18,7 @@ STORAGE_IMPLEMENTATIONS = {
             "MongoGraphStorage",
             "MemgraphStorage",
             "OpenSearchGraphStorage",
+            "HugeGraphGraphStorage",
         ],
         "required_methods": ["upsert_node", "upsert_edge"],
     },
@@ -40,6 +42,7 @@ STORAGE_IMPLEMENTATIONS = {
             "PGDocStatusStorage",
             "MongoDocStatusStorage",
             "OpenSearchDocStatusStorage",
+            "HugeGraphDocStatusStorage",
         ],
         "required_methods": ["get_docs_by_status"],
     },
@@ -108,6 +111,12 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     "OpenSearchVectorDBStorage": [
         "OPENSEARCH_HOSTS",
     ],
+    # HugeGraph Storage Implementations
+    # HUGEGRAPH_URL / HUGEGRAPH_GRAPH have built-in defaults, so no hard env
+    # requirements; empty list lets the env-check pass.
+    "HugeGraphKVStorage": [],
+    "HugeGraphGraphStorage": [],
+    "HugeGraphDocStatusStorage": [],
 }
 
 # Storage implementation module mapping
@@ -137,6 +146,10 @@ STORAGES = {
     "OpenSearchDocStatusStorage": ".kg.opensearch_impl",
     "OpenSearchGraphStorage": ".kg.opensearch_impl",
     "OpenSearchVectorDBStorage": ".kg.opensearch_impl",
+    # HugeGraph Storage Implementations (graph + KV + doc-status; no vector)
+    "HugeGraphGraphStorage": ".kg.hugegraph_impl",
+    "HugeGraphKVStorage": ".kg.hugegraph_impl",
+    "HugeGraphDocStatusStorage": ".kg.hugegraph_impl",
 }
 
 
