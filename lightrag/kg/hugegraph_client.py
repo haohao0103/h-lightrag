@@ -356,8 +356,13 @@ class HugeGraphClient:
         except Exception:  # noqa: BLE001
             return {}
 
-    async def delete_vertex(self, vid: str) -> bool:
-        url = f"{self._graph_prefix()}/graph/vertices/{self._enc_id(vid)}"
+    async def delete_vertex(self, vid: str, label: str | None = None) -> bool:
+        """Delete a vertex by id. If label is provided, only delete vertices
+        matching that label (HG 1.7.0 supports ?label= query param)."""
+        enc = self._enc_id(vid)
+        url = f"{self._graph_prefix()}/graph/vertices/{enc}"
+        if label:
+            url += f"?label={label}"
         resp = await self._client.delete(url)
         return resp.status_code in (200, 204)
 

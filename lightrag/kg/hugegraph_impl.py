@@ -58,6 +58,33 @@ RELATION_LABEL = "lightrag_relation"
 DOC_STATUS_LABEL = "lightrag_doc_status"
 
 
+def _to_timestamp(value: Any) -> int:
+    """Convert a value to unix timestamp (int).
+
+    Handles: int (passthrough), float (truncate), ISO timestamp string
+    (e.g. "2026-07-15T09:57:28+00:00"), None (→ 0).
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        # Try int first
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        # Try ISO timestamp
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except (ValueError, TypeError):
+            return 0
+    return 0
+DOC_STATUS_LABEL = "lightrag_doc_status"
+
+
 # ---------------------------------------------------------------------------
 # Graph storage
 # ---------------------------------------------------------------------------
@@ -493,7 +520,7 @@ class HugeGraphKVStorage(BaseKVStorage):
     async def delete(self, ids: list[str]) -> None:
         for kid in ids:
             try:
-                await self._driver.delete_vertex(kid)
+                await self._driver.delete_vertex(kid, label=self._kv_label)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"delete key {kid} failed: {e}")
 
@@ -511,6 +538,18 @@ class HugeGraphKVStorage(BaseKVStorage):
 @dataclass
 class HugeGraphDocStatusStorage(DocStatusStorage):
     """Document processing status backed by the ``lightrag_doc_status`` label."""
+
+    # HG 1.7.0 POST /vertices updates label if vertex id already exists.
+    # full_docs KV and doc_status use the same doc_id as key, so the second
+    # POST would overwrite the first vertex's label. Prefix doc_status vertex
+    # ids with "ds_" to avoid collision.
+    @staticmethod
+    def _vid(doc_id: str) -> str:
+        return f"ds_{doc_id}"
+
+    @staticmethod
+    def _doc_id(vid: str) -> str:
+        return vid[3:] if vid.startswith("ds_") else vid
 
     def __init__(
         self,
@@ -553,7 +592,7 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
         except Exception as e:  # noqa: BLE001
             return {"status": "error", "message": str(e)}
 
-    async def _parse_doc(self, v: dict) -> DocProcessingStatus | dict | None:
+    async def _parse_doc(self, v: dict) -> DocProcessingStatus | None:
         raw = v.get("properties", {}).get("kv_value")
         if raw is None:
             return None
@@ -561,12 +600,36 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
             data = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
-        if hasattr(DocProcessingStatus, "from_dict"):
-            try:
-                return DocProcessingStatus.from_dict(data)
-            except Exception:  # noqa: BLE001
-                return data
-        return data
+        # Manually construct DocProcessingStatus (no from_dict classmethod exists)
+        try:
+            status_raw = data.get("status", "")
+            if hasattr(status_raw, "value"):
+                status = status_raw
+            elif isinstance(status_raw, str):
+                # Accept both "PENDING" and "DocStatus.PENDING"
+                clean = status_raw.split(".")[-1] if "." in status_raw else status_raw
+                try:
+                    status = DocStatus(clean)
+                except ValueError:
+                    status = DocStatus.PENDING
+            else:
+                status = DocStatus.PENDING
+            return DocProcessingStatus(
+                content_summary=data.get("content_summary", ""),
+                content_length=int(data.get("content_length", 0) or 0),
+                file_path=data.get("file_path", data.get("file_basename", "unknown_source")),
+                status=status,
+                created_at=str(data.get("created_at", "")),
+                updated_at=str(data.get("updated_at", "")),
+                track_id=data.get("track_id"),
+                chunks_count=data.get("chunk_count") or data.get("chunks_count"),
+                chunks_list=data.get("chunks_list", []),
+                error_msg=data.get("error_msg"),
+                metadata=data.get("metadata", {}),
+                content_hash=data.get("content_hash"),
+            )
+        except Exception:
+            return None
 
     async def _fetch_docs_by_statuses(self, statuses: list[str]) -> dict[str, DocProcessingStatus]:
         assert self._driver is not None
@@ -579,28 +642,24 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
                 vid = str(v.get("id", ""))
                 if not vid:
                     continue
+                # Strip ds_ prefix to get the original doc_id
+                doc_id = self._doc_id(vid)
                 parsed = await self._parse_doc(v)
                 if parsed is not None:
-                    result[vid] = parsed
+                    result[doc_id] = parsed
         return result
 
     # -- BaseKVStorage passthroughs ------------------------------------------
 
-    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+    async def get_by_id(self, id: str) -> DocProcessingStatus | None:
         assert self._driver is not None
-        v = await self._driver.get_vertex_by_label(id, DOC_STATUS_LABEL)
+        v = await self._driver.get_vertex_by_label(self._vid(id), DOC_STATUS_LABEL)
         if v is None:
             return None
-        raw = v.get("properties", {}).get("kv_value")
-        if raw is None:
-            return None
-        try:
-            return json.loads(raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
+        return await self._parse_doc(v)
 
-    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
+    async def get_by_ids(self, ids: list[str]) -> list[DocProcessingStatus]:
+        result: list[DocProcessingStatus] = []
         for kid in ids:
             v = await self.get_by_id(kid)
             if v is not None:
@@ -612,7 +671,7 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
             return set()
         missing: set[str] = set()
         for k in keys:
-            v = await self._driver.get_vertex_by_label(k, DOC_STATUS_LABEL)
+            v = await self._driver.get_vertex_by_label(self._vid(k), DOC_STATUS_LABEL)
             if v is None:
                 missing.add(k)
         return missing
@@ -623,13 +682,21 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
             payload = json.dumps(value, ensure_ascii=False, default=str)
             payload_capped = cap_str(payload, 32000)
             if isinstance(value, dict):
-                status_val = str(value.get("status", ""))
+                # status may be a DocStatus enum; use .value if available
+                status_raw = value.get("status", "")
+                if hasattr(status_raw, "value"):
+                    status_val = status_raw.value
+                else:
+                    status_val = str(status_raw)
                 content_hash = str(value.get("content_hash", ""))
                 file_path = str(value.get("file_path", ""))
                 file_basename = str(value.get("file_basename", ""))
                 track_id = str(value.get("track_id", ""))
-                created_at = int(value.get("created_at") or 0)
-                updated_at = int(value.get("updated_at") or 0)
+                # LightRAG may pass created_at/updated_at as ISO timestamp
+                # strings (e.g. "2026-07-15T09:57:28+00:00") instead of ints.
+                # Convert to unix timestamp; fall back to 0 on failure.
+                created_at = _to_timestamp(value.get("created_at"))
+                updated_at = _to_timestamp(value.get("updated_at"))
                 chunk_count = int(value.get("chunk_count") or 0)
                 content_length = int(value.get("content_length") or 0)
             else:
@@ -648,12 +715,12 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
                 "chunk_count": chunk_count or None,
                 "content_length": content_length or None,
             }
-            await self._driver.upsert_vertex(DOC_STATUS_LABEL, doc_id, props)
+            await self._driver.upsert_vertex(DOC_STATUS_LABEL, self._vid(doc_id), props)
 
     async def delete(self, ids: list[str]) -> None:
         for kid in ids:
             try:
-                await self._driver.delete_vertex(kid)
+                await self._driver.delete_vertex(self._vid(kid), label=DOC_STATUS_LABEL)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"delete doc {kid} failed: {e}")
 
@@ -722,9 +789,10 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
                 vid = str(v.get("id", ""))
                 if not vid:
                     continue
+                doc_id = self._doc_id(vid)
                 parsed = await self._parse_doc(v)
                 if parsed is not None:
-                    docs[vid] = parsed
+                    docs[doc_id] = parsed
 
         total = len(docs)
         safe_sort = sort_field if sort_field in ("created_at", "updated_at", "id") else "updated_at"
@@ -732,12 +800,12 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
 
         def sort_key(item):
             _vid, dps = item
-            if isinstance(dps, dict):
-                val = dps.get(safe_sort, 0)
-                if safe_sort == "id":
-                    return _vid
-                return val or 0
-            return getattr(dps, safe_sort, 0) or 0
+            if safe_sort == "id":
+                return str(_vid)
+            val = getattr(dps, safe_sort, "") if not isinstance(dps, dict) else dps.get(safe_sort, "")
+            # Normalize to string for consistent sorting (timestamps may be
+            # ISO strings or ints depending on write path)
+            return str(val) if val is not None else ""
 
         items = sorted(docs.items(), key=sort_key, reverse=reverse)
         page = max(1, page)
@@ -774,7 +842,7 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
         if not verts:
             return None
         v = verts[0]
-        doc_id = str(v.get("id", ""))
+        doc_id = self._doc_id(str(v.get("id", "")))
         raw = v.get("properties", {}).get("kv_value")
         if not doc_id or raw is None:
             return None
@@ -793,7 +861,9 @@ class HugeGraphDocStatusStorage(DocStatusStorage):
         if not verts:
             return None
         v = verts[0]
-        doc_id = str(v.get("id", ""))
+        vid = str(v.get("id", ""))
+        # Strip ds_ prefix to return the original doc_id
+        doc_id = self._doc_id(vid)
         raw = v.get("properties", {}).get("kv_value")
         if not doc_id or raw is None:
             return None
