@@ -95,7 +95,7 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       showEdgeLabel: false,
       enableHideUnselectedEdges: true,
-      enableEdgeEvents: false,
+      enableEdgeEvents: true,
 
       minEdgeSize: 1,
       maxEdgeSize: 1,
