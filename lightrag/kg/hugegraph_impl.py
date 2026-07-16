@@ -391,10 +391,33 @@ class HugeGraphGraphStorage(BaseGraphStorage):
     async def get_knowledge_graph(
         self, node_id: str, max_depth: int = 3, max_nodes: int = 1000
     ) -> dict[str, Any]:
-        """Simplified subgraph extraction: k-hop BFS via REST edge listing."""
+        """Simplified subgraph extraction: k-hop BFS via REST edge listing.
+
+        The webui passes the entity_type (e.g. "artifact") as the label
+        parameter; the graph_routes layer routes this to node_id here. We
+        detect this case and seed the BFS from all nodes whose entity_type
+        matches, instead of from a single (non-existent) node.
+        """
+        assert self._driver is not None
+        # Check if node_id is actually a node id; if not, treat as entity_type
+        seed_ids: list[str] = []
+        direct = await self._driver.get_vertex(node_id)
+        if direct is not None and direct.get("label") == ENTITY_LABEL:
+            seed_ids = [node_id]
+        else:
+            # Treat as entity_type — collect matching node ids as seeds
+            type_verts = await self._driver.list_vertices(
+                label=ENTITY_LABEL, limit=max_nodes,
+                properties={"entity_type": node_id},
+            )
+            seed_ids = [str(v.get("id")) for v in type_verts if v.get("id")]
+
+        if not seed_ids:
+            return {"nodes": {}, "edges": []}
+
         nodes: dict[str, dict] = {}
         edges: list[dict] = []
-        frontier = [node_id]
+        frontier = seed_ids
         visited: set[str] = set()
         for _depth in range(max(1, max_depth)):
             if not frontier or len(nodes) >= max_nodes:
